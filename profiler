@@ -3,216 +3,200 @@
 Profile a command, giving max/avg threads, mem, i/o, etc..
 """
 
+#import collections
 import subprocess
 import argparse
-import psutil
-import time
 import sys
+import time
 
+import pprint
+import psutil
+
+pp = pprint.PrettyPrinter(indent=2, depth=3)
 
 ## Config
 
 DEFAULTS = {
-            'poll_freq': 1,
-            'cpu_threshold': .01,
-            }
+    'poll_freq': .1,
+    'cpu_threshold': .01,
+    }
 
 
 ## Classes
 
-class Profiler():
+class Profiler(object):
+    """Profiler class"""
     popen = None
     pid = None
     cmd = None
-    p = None
+    process = None
     proc_infos = []
-    aspect_infos = {}
-    max_aspect_infos = {}
-    min_aspect_infos = {}
-    avg_aspect_infos = {}
+    proc_summary = {}
+    max_rollup = {}
+    min_rollup = {}
+    avg_rollup = {}
 
     num_polls = 0
 
-    aspects = {'sum_num_threads': True,
-               'sum_running_threads': True,
-               'sum_memory_pss': True,
-               'sum_memory_swap': True,
-               'sum_memory_dirty': True,
-               'avg_cpu_percent': True,
-               'accum_cpu_percent': False,
-               'sum_cpu_percent': True,
-               'accum_name': False,
-               'accum_pid': False,
-               }
-
-
-    def __init__(self, **kwargs):
-        if 'cmd' in kwargs:
-            self.cmd = kwargs['cmd']
-        elif 'pid' in kwargs:
-            self.pid = kwargs['pid']
-            self.p = psutil.Process(self.pid)
-
+    exclude = [
+        'cmdline',
+        'cpu_affinity',
+        'create_time',
+        'cwd',
+        'exe',
+        'gids',
+        'name',
+        'pid',
+        'ppid',
+        'status',
+        'terminal',
+        'uids',
+        'username',
+        ]
 
     def __init__(self, **kwargs):
         if 'cmd' in kwargs:
             self.cmd = kwargs['cmd']
         elif 'pid' in kwargs:
             self.pid = kwargs['pid']
-            self.p = psutil.Process(self.pid)
+            self.process = psutil.Process(self.pid)
 
 
     def run(self):
+        """Run our command"""
         print "Executing {0}".format(self.cmd)
-        self.popen = subprocess.Popen(self.cmd, shell=True)
+        self.popen = subprocess.Popen(self.cmd, shell=True, stderr=None, stdout=None, stdin=None)
         if self.popen.pid:
             self.pid = self.popen.pid
-            self.p = psutil.Process(self.pid)
+            self.process = psutil.Process(self.pid)
 
 
     def watch(self):
+        """Watch our process"""
+
         print "Watching command with pid: {0}".format(self.pid)
 
-        while self.p.is_running():
-            if self.poll_aspects():
-                self.rollup_aspects()
-                self.report_aspects()
+        while self.process.is_running():
+            if self.poll_procs():
+                rollup_dict(self.max_rollup, self.proc_summary, 'max', self.num_polls)
+                rollup_dict(self.min_rollup, self.proc_summary, 'min', self.num_polls)
+                rollup_dict(self.avg_rollup, self.proc_summary, 'avg', self.num_polls)
+
                 time.sleep(DEFAULTS['poll_freq'])
             else:
                 break
 
         print "Process {0} has exited".format(self.pid)
 
+        print "\n*** Max ***"
+        self.report(self.max_rollup)
+        print "\n*** Min ***"
+        self.report(self.min_rollup)
+        print "\n*** Avg ***"
+        self.report(self.avg_rollup)
 
-    def poll_aspects(self):
-        #print "Entered poll_aspects"
 
-        self.poll_proc_infos()
-        if not len(self.proc_infos):
+
+    def poll_procs(self):
+        """Poll the info of the processes"""
+        #print "Entered poll_procs"
+
+        self.snapshot_proc_infos()
+        self.add_virt_infos()
+
+        if len(self.proc_infos) < 1:
             return False
 
-        self.num_polls += 1
-        self.aspect_infos = {}
+        else:
+            self.num_polls += 1
 
-        for aspect in self.aspects.keys():
-            #print "Polling aspect: {0}".format(aspect)
-            self.aspect_infos[aspect] = self.get_aspect(aspect)
+            # Merge all proc infos into one object
+            self.proc_summary = {}
+            for proc_info in self.proc_infos:
+                #print "Accumulating {0} to summary".format(proc_info['pid'])
+                rollup_dict(self.proc_summary, proc_info, 'accum', self.num_polls)
 
-        return True
+            #print "**** proc_infos:"
+            #pp.pprint(self.proc_infos)
+            #print "**** Summary"
+            #pp.pprint(self.proc_summary)
 
-
-    def rollup_aspects(self):
-        #print "Entered rollup_aspects"
-
-        #import pdb; pdb.set_trace()
-        for aspect in self.aspects.keys():
-
-            # Only rollup specific aspects
-            if self.aspects[aspect]:
-                #print "Rolling up: {0}".format(aspect)
-
-                # The first time through, init the rollup aspect_infos with our current values
-                if not aspect in self.max_aspect_infos:
-                    self.max_aspect_infos[aspect] = self.aspect_infos[aspect]
-                    self.min_aspect_infos[aspect] = self.aspect_infos[aspect]
-                    self.avg_aspect_infos[aspect] = self.aspect_infos[aspect]
-
-                    continue
-
-                if self.aspect_infos[aspect] > self.max_aspect_infos[aspect]:
-                    print "New max {0}: {1} (old: {2})".format(aspect, self.aspect_infos[aspect], self.max_aspect_infos[aspect])
-                    self.max_aspect_infos[aspect] = self.aspect_infos[aspect]
-
-                if self.aspect_infos[aspect] < self.min_aspect_infos[aspect]:
-                    print "New min {0}: {1} (old: {2})".format(aspect, self.aspect_infos[aspect], self.min_aspect_infos[aspect])
-                    self.min_aspect_infos[aspect] = self.aspect_infos[aspect]
-
-                self.avg_aspect_infos[aspect] = (self.avg_aspect_infos[aspect] * self.num_polls + self.aspect_infos[aspect])/self.num_polls
-
-    def report_aspects(self):
-        #print "Entered report_aspects"
-
-        for aspect in self.aspects.keys():
-            if self.aspects[aspect]:
-                rollup_info = ", Max: {0}, Min: {1}, Avg: {2}".format(self.max_aspect_infos[aspect],
-                                                                      self.min_aspect_infos[aspect],
-                                                                      self.avg_aspect_infos[aspect])
-            else:
-                rollup_info = ""
-
-            print "{0} Now: {1}{2}".format(aspect, self.aspect_infos[aspect], rollup_info)
-        print
+            return True
 
 
-    def poll_proc_infos(self):
-        procs = self.p.children(recursive=True)
-        procs.append(self.p)
+    def report(self, proc_info):
+        """Report on the proc infos and rollup"""
 
+        for aspect, value in proc_info.iteritems():
+            if aspect in self.exclude:
+                continue
+            print "{0}: {1}".format(aspect, pp.pformat(value))
+
+
+    def snapshot_proc_infos(self):
+        """Grab info on all the processes"""
+
+        # Identify all the processes to check
+        procs = self.process.children(recursive=True)
+        procs.append(self.process)
+
+        #print "Found {0} processes".format(len(procs))
+
+        # Get the info on each
         self.proc_infos = []
         for proc in procs:
             try:
-                self.proc_infos.append(proc.as_dict())
+                self.proc_infos.append(self.plainify(proc.as_dict()))
             except:
                 #print "Couldn't get proc: {0}".format(proc.pid)
                 pass
 
+    def add_virt_infos(self):
+        """Add derived data info to the processes"""
 
-    def get_aspect(self, aspect):
-        proc_infos = self.proc_infos
+        for proc in self.proc_infos:
+            # Add v_threads_running flag
+            if self.is_running(proc):
+                proc['v_threads_running'] = 1
+            else:
+                proc['v_threads_running'] = 0
 
-        prefix = aspect.split('_')[0]
-        aspect = '_'.join(aspect.split('_')[1:])
 
-        #import pdb; pdb.set_trace()
-        if aspect == 'num_threads':
-            aspect_infos = [proc['num_threads'] for proc in proc_infos]
+    def plainify(self, obj):
+        """Convert a given nested object containing structs and objects with custom fields,
+        to a plain list, dict, literal, etc, with the custom fields as a dict"""
 
-        elif aspect == 'running_threads':
-            aspect_infos = [proc['num_threads'] for proc in proc_infos if self.is_running(proc)]
+        out = None
+        if isinstance(obj, str) or isinstance(obj, float) or isinstance(obj, int):
+            out = obj
 
-        elif aspect == 'memory_pss':
-            aspect_infos = [proc['memory_full_info'].pss for proc in proc_infos]
+        elif isinstance(obj, list):
+            out = [self.plainify(item) for item in obj]
 
-        elif aspect == 'memory_swap':
-            aspect_infos = [proc['memory_full_info'].swap for proc in proc_infos]
-
-        elif aspect == 'memory_dirty':
-            aspect_infos = [proc['memory_full_info'].dirty for proc in proc_infos]
-
-        elif aspect == 'cpu_percent':
-            aspect_infos = [proc['cpu_percent'] for proc in proc_infos]
-
-        elif aspect == 'name':
-            aspect_infos = [proc['name'] for proc in proc_infos]
-
-        elif aspect == 'pid':
-            aspect_infos = [proc['pid'] for proc in proc_infos]
+        elif isinstance(obj, dict):
+            out = {key: self.plainify(value) for key, value in obj.iteritems()}
 
         else:
-            raise "Unknown Aspect"
-        
-        if prefix == 'sum':
-            result = sum(aspect_infos)
-        elif prefix == 'avg':
-            result = sum(aspect_infos)/len(proc_infos)
-        elif prefix == 'accum':
-            result = aspect_infos
+            out = self.plainify(dict(zip(obj.__class__._fields, obj)))
 
-        return result
+        return out
 
 
-    def is_running(self, p):
+    def is_running(self, process):
+        """Guess whether this process has run since the last time we polled"""
         try:
-            (pid, percent) = (p['pid'], p['cpu_percent'])
+            (_, percent) = (process['pid'], process['cpu_percent'])
             running = percent > DEFAULTS['cpu_threshold']
         except:
             running = False
 
         return running
 
+
 ## Functions
 
 def parse_args():
+    """Parse given args"""
     parser = argparse.ArgumentParser(description='Profile a command')
     parser.add_argument('--cmd',
                         action='store',
@@ -225,6 +209,7 @@ def parse_args():
 
 
 def main():
+    """Main"""
     args = parse_args()
 
     if args.cmd:
@@ -239,6 +224,81 @@ def main():
         sys.exit(1)
 
     profiler.watch()
+
+
+def rollup_dict(roll_obj, obj, rollup_type, num_polls):
+    """Recursively roll up the given object (according to it's type), given a rollup obj
+    of the same structure"""
+
+    #print "rollup_dict({0}, {1}, {2}, {3})".format(roll_obj, obj, rollup_type, num_polls)
+
+    if roll_obj is None:
+        roll_obj = {}
+
+    # Rollup each value in the dict
+    for key, value in obj.iteritems():
+        #print "Rolling up dict item {0}:{1}".format(key, value)
+        # Init our roll_obj, so we don't throw errors further on
+        if key not in roll_obj:
+            roll_obj[key] = None
+
+        if isinstance(value, dict):
+            # Case of a dict, rollup recursively
+            #print "\nRolling up sub_dict rollup_dict({0}, {1}, {2})".format(roll_obj.get(key, {}),
+            #                                                              value,
+            #                                                              rollup_type)
+            sub_dict = rollup_dict(roll_obj.get(key, {}), value, rollup_type, num_polls)
+            #print "Result: {0}:{1}\n".format(key, sub_dict)
+            roll_obj[key] = sub_dict
+
+        elif isinstance(value, list):
+            # Case of a list, rollup the length of the list
+            roll_obj[key] = rollup_obj(roll_obj[key], len(value), rollup_type, num_polls)
+
+        elif isinstance(value, float) or isinstance(value, int) or isinstance(value, str):
+            # Case of a list, rollup the length of the list
+            roll_obj[key] = rollup_obj(roll_obj[key], value, rollup_type, num_polls)
+
+        elif value is None:
+            pass
+            #print "value is None??"
+
+        else:
+            raise "Unknown rollup_dict item type"
+
+    return roll_obj
+
+
+def rollup_obj(rollup_value, new_value, rollup_type, num_items):
+    """ Rollup a given prev rollup value, new value, rollup type
+    (max, min, avg, accum), num items"""
+
+    #print "rollup_obj({0}, {1}, {2}, {3})".format(rollup_value, new_value, rollup_type, num_items)
+
+    # Many of the cases, result is the new_value
+    result = new_value
+
+    # Set result to something else, in these cases
+    if rollup_value is not None:
+        if rollup_type is 'max':
+            if new_value < rollup_value:
+                result = rollup_value
+
+        elif rollup_type is 'min':
+            if new_value > rollup_value:
+                result = rollup_value
+
+        elif rollup_type is 'avg':
+            if not isinstance(rollup_value, str) and not isinstance(new_value, str):
+                result = (rollup_value * (num_items - 1) + new_value) / num_items
+
+        elif rollup_type == 'accum':
+            if not isinstance(rollup_value, str) and not isinstance(new_value, str):
+                result = rollup_value + new_value
+                #print "Accumulated {0} + {1} = {2}".format(rollup_value, new_value, result)
+
+    #print "Returning result: {0}".format(result)
+    return result
 
 
 ## Main

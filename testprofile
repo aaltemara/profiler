@@ -1,0 +1,12 @@
+#!/bin/bash
+
+
+sub_shell1() {
+  md5sum /tmp/* &>/dev/null
+}
+
+sub_shell1 &
+
+find ~ | xargs -n 1 md5sum &>/dev/null
+
+
