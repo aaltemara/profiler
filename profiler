@@ -14,14 +14,16 @@ import psutil
 
 pp = pprint.PrettyPrinter(indent=2, depth=3)
 
+
 ## Config
 
 DEFAULTS = {
-    'poll_freq': .1,
+    'poll_wait': .1,
     'cpu_threshold': .01,
     'max_polls': 0,
     'min_polls': 5,
     }
+ARGS = None
 
 
 ## Classes
@@ -76,14 +78,14 @@ class Profiler(object):
 
         print "Watching command with pid: {0}".format(self.pid)
 
-        while (DEFAULTS['max_polls'] == 0 or self.num_polls <= DEFAULTS['max_polls']):
+        while (ARGS.max_polls == 0 or self.num_polls <= ARGS.max_polls):
             if self.poll_procs() or self.num_polls < DEFAULTS['min_polls']:
                 rollup_dict(self.rollup, self.proc_info_summary)
 
                 #print "\n" + "#" * 100 + "\n"
                 #pp.pprint(self.rollup)
 
-                time.sleep(DEFAULTS['poll_freq'])
+                time.sleep(ARGS.poll_wait)
             else:
                 break
             sys.stdout.flush()
@@ -226,19 +228,32 @@ def parse_args():
                         action='store',
                         type=int,
                         help='Process ID to profile')
+    parser.add_argument('--max-polls',
+                        action='store',
+                        dest='max_polls',
+                        default=DEFAULTS['max_polls'],
+                        type=int,
+                        help='Max number of polls. Default: {0}'.format(DEFAULTS['max_polls']))
+    parser.add_argument('--poll-wait',
+                        action='store',
+                        dest='poll_wait',
+                        default=DEFAULTS['poll_wait'],
+                        type=float,
+                        help='Wait time in seconds between polls. Can be a float. Default: {0}'.format(DEFAULTS['poll_wait']))
     return parser.parse_args()
 
 
 def main():
     """Main"""
-    args = parse_args()
+    global ARGS
+    ARGS = parse_args()
 
-    if args.cmd:
-        profiler = Profiler(cmd=args.cmd)
+    if ARGS.cmd:
+        profiler = Profiler(cmd=ARGS.cmd)
         profiler.run()
 
-    elif args.pid:
-        profiler = Profiler(pid=args.pid)
+    elif ARGS.pid:
+        profiler = Profiler(pid=ARGS.pid)
 
     else:
         print "You must specify --cmd or --pid"
