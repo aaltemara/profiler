@@ -22,6 +22,7 @@ DEFAULTS = {
     'cpu_threshold': .01,
     'max_polls': 0,
     'min_polls': 5,
+    'verbosity': 1,
     }
 ARGS = None
 
@@ -78,12 +79,16 @@ class Profiler(object):
 
         print "Watching command with pid: {0}".format(self.pid)
 
-        while (ARGS.max_polls == 0 or self.num_polls <= ARGS.max_polls):
+        while (ARGS.max_polls == 0 or self.num_polls < ARGS.max_polls):
             if self.poll_procs() or self.num_polls < DEFAULTS['min_polls']:
                 rollup_dict(self.rollup, self.proc_info_summary)
 
+                #print "self.rollup: {0}".format(pp.pformat(self.rollup['v_threads_running']))
                 #print "\n" + "#" * 100 + "\n"
                 #pp.pprint(self.rollup)
+
+                #if ARGS.verbosity > 2:
+                #    self.report()
 
                 time.sleep(ARGS.poll_wait)
             else:
@@ -109,8 +114,11 @@ class Profiler(object):
         else:
             # Merge all proc infos into one object
             proc_info_summary_rollup = {}
+            #print "num proc_infos: {0}".format(len(self.proc_infos))
+            #print "proc_infos[0]: {0}".format(self.proc_infos[0]['pid'])
             for proc_info in self.proc_infos:
                 #print "Accumulating {0} to summary".format(proc_info['pid'])
+                #print "proc_info: {0}".format(pp.pformat(proc_info['v_threads_running']))
                 rollup_dict(proc_info_summary_rollup, proc_info)
                 #print "pi: {0} pisr: {1}".format(proc_info['v_threads_running'], proc_info_summary_rollup['v_threads_running'])
 
@@ -142,6 +150,7 @@ class Profiler(object):
 
         # Identify all the processes to check
         procs = self.process.children(recursive=True)
+
         procs.append(self.process)
 
         #print "Found {0} processes".format(len(procs))
@@ -174,10 +183,10 @@ class Profiler(object):
         # Add v_threads_running flag
         if self.is_running(proc):
             #print "proc {0} is running".format(proc)
-            proc['v_threads_running'] = 1
+            proc['v_threads_running'] = proc['num_threads']
         else:
             #print "proc {0} isn't running".format(proc)
-            proc['v_threads_running'] = 0
+            proc['v_threads_running'] = proc['num_threads']
 
 
     def plainify(self, obj):
@@ -240,6 +249,12 @@ def parse_args():
                         default=DEFAULTS['poll_wait'],
                         type=float,
                         help='Wait time in seconds between polls. Can be a float. Default: {0}'.format(DEFAULTS['poll_wait']))
+    parser.add_argument('-v',
+                        action='count',
+                        dest='verbosity',
+                        default=DEFAULTS['verbosity'],
+                        help='Increase the verbosity level')
+
     return parser.parse_args()
 
 
