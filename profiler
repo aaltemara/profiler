@@ -54,8 +54,8 @@ class Profiler(object):
     stdout = None
     stdin = None
 
-    start_watching = None
-    stop_watching = None
+    start_time = None
+    stop_time = None
     returncode = None
 
     last_report_time = 0
@@ -95,6 +95,7 @@ class Profiler(object):
             self.outfile = kwargs['outfile']
 
         self.status = "new"
+        self.report()
 
 
     def run(self):
@@ -110,15 +111,36 @@ class Profiler(object):
             self.pid = self.popen.pid
             self.process = psutil.Process(self.pid)
 
+        self.report()
+
+        # Our shell process should have at least 1 child, the command
+        if len(self.process.children()) > 0:
+            self.status = "running"
+
+        elif not self.process.is_running():
+            self.status = "failed"
+
+        else:
+            self.status = "failed"
+            # Let the shell process catch up to the failed child process, so it can exit
+            self.popen.communicate()
+
+        self.report()
+
+        if self.status == "running":
+            return True
+        else:
+            return False
+
 
     def watch_process(self):
         """Watch our parent process and all children"""
 
-        self.start_watching = time.strftime(DEFAULTS['time_format'])
+        self.start_time = time.strftime(DEFAULTS['time_format'])
         self.status = "watching"
 
         #print "Watching command with pid: {0}".format(self.pid)
-        while ARGS.max_polls == 0 or self.num_polls < ARGS.max_polls:
+        while (ARGS.max_polls == 0 or self.num_polls < ARGS.max_polls):
             if self.poll_processes():
                 rollup_dict(self.rollup, self.proc_info_summary)
 
@@ -128,10 +150,10 @@ class Profiler(object):
 
                 try:
                     gone, alive = psutil.wait_procs([self.process],
-                                      timeout=ARGS.poll_wait,
-                                      callback=self.on_terminate)
+                                                    timeout=ARGS.poll_wait,
+                                                    callback=self.on_terminate)
 
-                    if gone:
+                    if not alive:
                         break
 
                 except psutil.TimeoutExpired:
@@ -142,7 +164,7 @@ class Profiler(object):
         #print "Process {0} has exited".format(self.pid)
         filter_dict(self.rollup, ['accum', 'num_polls'])
 
-        self.stop_watching = time.strftime(DEFAULTS['time_format'])
+        self.stop_time = time.strftime(DEFAULTS['time_format'])
         self.status = "exited"
 
 
@@ -234,7 +256,7 @@ class Profiler(object):
 
     def report(self):
         """Report on the proc infos and rollups"""
-    
+
         self.last_report_time = time.time()
 
         report = {
@@ -245,9 +267,11 @@ class Profiler(object):
                 "status": self.status,
                 "cmd": self.cmd,
                 "pid": self.pid,
-                "start_watching": self.start_watching,
-                "stop_watching": self.stop_watching,
+                "start_time": self.start_time,
+                "stop_time": self.stop_time,
                 "returncode": self.returncode,
+                "poll_wait": ARGS.poll_wait,
+                "report_wait": ARGS.report_wait,
             }
         }
         with open(self.outfile, 'w') as fh:
@@ -436,7 +460,9 @@ def main():
     # Run the command, or grab an existing one
     if ARGS.cmd:
         profiler = Profiler(cmd=ARGS.cmd, stdout=cmd_stdout, stderr=cmd_stderr, outfile=ARGS.out)
-        profiler.run()
+        if not profiler.run():
+            print "Command failed"
+            sys.exit(2)
 
     elif ARGS.pid:
         profiler = Profiler(pid=ARGS.pid)
