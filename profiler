@@ -9,6 +9,7 @@ import argparse
 import os
 import sys
 import time
+import json
 
 import pprint
 import psutil
@@ -18,16 +19,19 @@ pp = pprint.PrettyPrinter(indent=2, depth=3)
 
 ## Config
 
+VERSION = "0.8.0"
+
 DEFAULTS = {
     'poll_wait': .1,
+    'report_wait': 2,
     'cpu_threshold': .01,
     'max_polls': 0,
-    'min_polls': 5,
     'verbosity': 1,
-    'out': None,
+    'out': '/dev/stdout',
     'stderr': None,
     'stdout': None,
     'stdin': None,
+    'time_format': "%Y%m%d-%H%M%S",
     }
 ARGS = None
 
@@ -44,10 +48,18 @@ class Profiler(object):
     proc_info_summary = {}
     rollup = {}
     num_polls = 0
+    status = None
 
     stderr = None
     stdout = None
     stdin = None
+
+    start_watching = None
+    stop_watching = None
+    returncode = None
+
+    last_report_time = 0
+    outfile = '/dev/stdout'
 
     exclude = [
         'cmdline',
@@ -79,111 +91,98 @@ class Profiler(object):
         if 'stderr' in kwargs:
             self.stderr = kwargs['stderr']
 
+        if 'outfile' in kwargs:
+            self.outfile = kwargs['outfile']
+
+        self.status = "new"
+
+
     def run(self):
         """Run our command"""
-        print "Executing {0}".format(self.cmd)
-        self.popen = subprocess.Popen(self.cmd, shell=True, stderr=self.stderr, stdout=self.stdout, stdin=self.stdin)
+
+        self.status = "starting"
+        self.popen = subprocess.Popen(self.cmd,
+                                      shell=True,
+                                      stderr=self.stderr,
+                                      stdout=self.stdout,
+                                      stdin=self.stdin)
         if self.popen.pid:
             self.pid = self.popen.pid
             self.process = psutil.Process(self.pid)
 
 
-    def watch(self):
-        """Watch our process"""
+    def watch_process(self):
+        """Watch our parent process and all children"""
 
-        print "Watching command with pid: {0}".format(self.pid)
+        self.start_watching = time.strftime(DEFAULTS['time_format'])
+        self.status = "watching"
 
-        while (ARGS.max_polls == 0 or self.num_polls < ARGS.max_polls):
-            if self.poll_procs() or self.num_polls < DEFAULTS['min_polls']:
+        #print "Watching command with pid: {0}".format(self.pid)
+        while ARGS.max_polls == 0 or self.num_polls < ARGS.max_polls:
+            if self.poll_processes():
                 rollup_dict(self.rollup, self.proc_info_summary)
 
-                #print "self.rollup: {0}".format(pp.pformat(self.rollup['v_threads_running']))
-                #print "\n" + "#" * 100 + "\n"
-                #pp.pprint(self.rollup)
-
-                if ARGS.verbosity > 2:
+                # Report, if enough time has elapsed since last report
+                if (time.time() - ARGS.report_wait) > self.last_report_time:
                     self.report()
 
-                time.sleep(ARGS.poll_wait)
-            else:
-                break
+                try:
+                    gone, alive = psutil.wait_procs([self.process],
+                                      timeout=ARGS.poll_wait,
+                                      callback=self.on_terminate)
+
+                    if gone:
+                        break
+
+                except psutil.TimeoutExpired:
+                    pass
+
             sys.stdout.flush()
 
-        print "Process {0} has exited".format(self.pid)
+        #print "Process {0} has exited".format(self.pid)
+        filter_dict(self.rollup, ['accum', 'num_polls'])
 
-        filter_dict(self.rollup, ['accum', 'num_polls']) 
-        self.report()
+        self.stop_watching = time.strftime(DEFAULTS['time_format'])
+        self.status = "exited"
 
 
-    def poll_procs(self):
-        """Poll the info of the processes"""
-        #print "Entered poll_procs"
+    def poll_processes(self):
+        """Poll the snapshotted info of the parent and child processes,
+           rolling all into a single snapshot"""
 
         self.snapshot_proc_infos()
         self.num_polls += 1
 
         if len(self.proc_infos) < 1:
-            print "Not able to poll processes"
+            #print "Not able to poll processes"
             return False
         else:
             # Merge all proc infos into one object
             proc_info_summary_rollup = {}
-            #print "num proc_infos: {0}".format(len(self.proc_infos))
-            #print "proc_infos[0]: {0}".format(self.proc_infos[0]['pid'])
             for proc_info in self.proc_infos:
-                #print "Accumulating {0} to summary".format(proc_info['pid'])
-                #print "proc_info: {0}".format(pp.pformat(proc_info['v_threads_running']))
                 rollup_dict(proc_info_summary_rollup, proc_info)
-                #print "pi: {0} pisr: {1}".format(proc_info['v_threads_running'], proc_info_summary_rollup['v_threads_running'])
 
-            #pp.pprint(self.proc_info_summary)
             self.proc_info_summary = flatten_dict(proc_info_summary_rollup, ['accum'])
-            #print "pis: {0}".format(self.proc_info_summary['num_threads'])
-
-            #pp.pprint(self.proc_info_summary)
-            #print "**** proc_infos:"
-            #pp.pprint(self.proc_infos)
-            #print "**** Summary"
-            #pp.pprint(self.proc_info_summary)
-
             return True
 
 
-    def report(self):
-        """Report on the proc infos and rollups"""
-
-        print pp.pformat(self.rollup)
-        return
-
-        for aspect, value in self.rollup:
-            print "{0}: {1}".format(aspect, pp.pformat(value))
-
-
     def snapshot_proc_infos(self):
-        """Grab info on all the processes"""
-
+        """Grab from the OS the info on all the watched processes, converting it
+           to dict, adding some derived info."""
         # Identify all the processes to check
         procs = self.process.children(recursive=True)
-
         procs.append(self.process)
 
-        #print "Found {0} processes".format(len(procs))
-
-        # Get the info on each
+        # Get the info on each process in the tree
         self.proc_infos = []
         for proc in procs:
             try:
                 proc_as_dict = proc.as_dict()
-                #print "proc_as_dict: {0}".format(proc_as_dict)
                 for aspect in self.exclude:
                     proc_as_dict.pop(aspect, None)
 
                 proc_info = self.plainify(proc_as_dict)
-                #print "proc_info: {0}".format(proc_info)
-                #print "before add_virt proc_info['pid']: {0}".format(proc_info.get('pid', None))
                 self.add_virt_infos(proc_info)
-                #print "snap v_t_r: {0}".format(proc_info['v_threads_running'])
-                #print "after add_virt proc_info['pid']: {0}".format(proc_info.get('pid', None))
                 self.proc_infos.append(proc_info)
             except:
                 #print "Couldn't get proc: {0}".format(proc.pid)
@@ -192,22 +191,15 @@ class Profiler(object):
 
     def add_virt_infos(self, proc):
         """Add derived data info to the process"""
-
-        #print "add_virt_infos: cpu_percent: {0}".format(proc['cpu_percent'])
         # Add v_threads_running flag
-        if self.is_running(proc):
-            #print "proc {0} is running".format(proc)
-            proc['v_threads_running'] = proc['num_threads']
-        else:
-            #print "proc {0} isn't running".format(proc)
-            proc['v_threads_running'] = proc['num_threads']
+        proc['v_threads_running'] = proc['num_threads']
 
 
     def plainify(self, obj):
         """Convert a given nested object containing structs and objects with custom fields,
         to a plain list, dict, literal, etc, with the custom fields as a dict"""
-
         out = None
+
         if isinstance(obj, str) or isinstance(obj, float) or isinstance(obj, int):
             out = obj
 
@@ -225,18 +217,41 @@ class Profiler(object):
 
     def is_running(self, process):
         """Guess whether this process has run since the last time we polled"""
-        #print "is_running: cpu_percent: {0} threshold: {1}".format(process['cpu_percent'], DEFAULTS['cpu_threshold'])
         cpu_percent = process.get('cpu_percent', None)
         pid = process.get('pid', None)
-
-        #print pid,cpu_percent,
 
         if cpu_percent is not None and pid is not None:
             running = cpu_percent > DEFAULTS['cpu_threshold']
         else:
             running = False
-       
+
         return running
+
+
+    def on_terminate(self, proc):
+        self.returncode = proc.returncode
+
+
+    def report(self):
+        """Report on the proc infos and rollups"""
+    
+        self.last_report_time = time.time()
+
+        report = {
+            "rollup": self.rollup,
+            "version": VERSION,
+            "meta": {
+                "num_polls": self.num_polls,
+                "status": self.status,
+                "cmd": self.cmd,
+                "pid": self.pid,
+                "start_watching": self.start_watching,
+                "stop_watching": self.stop_watching,
+                "returncode": self.returncode,
+            }
+        }
+        with open(self.outfile, 'w') as fh:
+            json.dump(report, fh, sort_keys=True, indent=4, separators=(',', ': '))
 
 
 ## Functions
@@ -258,7 +273,14 @@ def parse_args():
                         dest='poll_wait',
                         default=DEFAULTS['poll_wait'],
                         type=float,
-                        help='Wait time in seconds between polls. Can be a float. Default: {0}'.format(DEFAULTS['poll_wait']))
+                        help=('Wait time in seconds between polls.'
+                              'Can be a float. Default: {0}').format(DEFAULTS['poll_wait']))
+    parser.add_argument('--report-wait',
+                        dest='report_wait',
+                        default=DEFAULTS['report_wait'],
+                        help=('Wait time in seconds to repeatedly write an interim result to the '
+                              'report file. 0 indicates no interim reports, only final. '
+                              ' Default is {0}s'.format(DEFAULTS['report_wait'])))
     parser.add_argument('-v',
                         action='count',
                         dest='verbosity',
@@ -276,67 +298,31 @@ def parse_args():
                         dest='stderr',
                         default=DEFAULTS['stderr'],
                         help='File to append STDERR of the command')
+    parser.add_argument('--version',
+                        dest='version',
+                        action='store_true',
+                        default=False,
+                        help='Output version')
 
     return parser.parse_args()
-
-
-def main():
-    """Main"""
-    global ARGS
-    ARGS = parse_args()
-
-    if ARGS.out is not None:
-        backup_file(ARGS.out) 
-        sys.stdout = open(ARGS.out, 'w') 
-
-    if ARGS.stdout is not None:
-        backup_file(ARGS.stdout) 
-        cmd_stdout = open(ARGS.stdout, 'w')
-    else:
-        cmd_stdout = None
-
-    if ARGS.stderr is not None:
-        backup_file(ARGS.stderr) 
-        cmd_stderr = open(ARGS.stderr, 'w') 
-    else:
-        cmd_stderr = None
-
-    if ARGS.cmd:
-        profiler = Profiler(cmd=ARGS.cmd, stdout=cmd_stdout, stderr=cmd_stderr)
-        profiler.run()
-
-    elif ARGS.pid:
-        profiler = Profiler(pid=ARGS.pid)
-
-    else:
-        print "You must specify --cmd or --pid"
-        sys.exit(1)
-
-    profiler.watch()
 
 
 def rollup_dict(rolling_dict, obj):
     """Recursively roll up the given object (according to it's type), given a rollup obj
     previously created with this"""
-    
-    #print "rollup_dict({0}, {1})".format(rolling_dict, obj)
 
     if rolling_dict is None:
         rolling_dict = {}
 
     # Rollup each value in the dict
     for key, value in obj.iteritems():
-        #print "Rolling up dict item {0}:{1}".format(key, value)
         # Init our rolling_dict, so we don't throw errors further on
         if key not in rolling_dict:
             rolling_dict[key] = None
 
         if isinstance(value, dict):
             # Case of a dict, rollup recursively
-            #print "\n- Rolling up sub_dict rollup_dict({0}, {1})".format(rolling_dict.get(key, {}), value)
-
             sub_dict = rollup_dict(rolling_dict.get(key, {}), value)
-            #print "Result: {0}:{1}\n".format(key, sub_dict)
             rolling_dict[key] = sub_dict
 
         elif isinstance(value, list):
@@ -349,17 +335,15 @@ def rollup_dict(rolling_dict, obj):
 
         elif value is None:
             pass
-            #print "value is None??"
 
         else:
             raise "Unknown rollup_dict item type"
 
-    #print "\n\nrollup_dict: returning {0}".format(rolling_dict)
     return rolling_dict
 
 
 def filter_dict(given_obj, keys_to_remove):
-    """Recursively walk the given obj and remove list of keys if it's a dict"""
+    """Recursively walk the given obj and remove given keys if it's a dict"""
 
     # Filter this if it's a dict
     if isinstance(given_obj, dict):
@@ -368,13 +352,10 @@ def filter_dict(given_obj, keys_to_remove):
 
     # Filter each value in the dict
     for key, value in given_obj.iteritems():
-        #print "Filtering dict item {0}:{1}".format(key, value)
-
         if isinstance(value, dict):
             # Element is another dict, filter recursively
             filter_dict(given_obj[key], keys_to_remove)
 
-    #print "\n\nrollup_dict: returning {0}".format(rolling_dict)
     return given_obj
 
 
@@ -382,27 +363,19 @@ def flatten_dict(given_obj, keys_to_replace):
     """Recursively walk the given obj and replace dict {given_keys: X} with their X values"""
 
     for key, value in given_obj.iteritems():
-        #print "Flattening dict item {0}:{1}".format(key, value)
         if isinstance(value, dict):
-            #print "{0} is a dict".format(key)
             replace_keys = list(set(value.keys()) & set(keys_to_replace))
             if len(replace_keys) > 0:
-                #if key == 'v_threads_running':
-                    #print "Collapsing {0} to {1}".format(key, value[replace_keys[0]])
                 given_obj[key] = value[replace_keys[0]]
             else:
                 # Element is another dict, filter recursively
                 flatten_dict(given_obj[key], keys_to_replace)
-        
 
-    #print "\n\nrollup_dict: returning {0}".format(rolling_dict)
     return given_obj
 
 
 def rollup_obj(rolling_obj, new_value):
     """ Rollup a given prev rollup dict, new value with (max, min, avg, accum)"""
-
-    #print "rollup_obj({0}, {1})".format(rolling_obj, new_value)
 
     # Set result to something else, in these cases
     if rolling_obj is not None:
@@ -411,21 +384,24 @@ def rollup_obj(rolling_obj, new_value):
         if new_value > rolling_obj['max']:
             rolling_obj['max'] = new_value
 
-        if new_value <  rolling_obj['min']:
+        if new_value < rolling_obj['min']:
             rolling_obj['min'] = new_value
 
         if not isinstance(rolling_obj['avg'], str) and not isinstance(new_value, str):
-            rolling_obj['avg'] = (rolling_obj['avg'] * (rolling_obj['num_polls'] - 1) + new_value) / rolling_obj['num_polls']
+            rolling_obj['avg'] = (rolling_obj['avg'] * (rolling_obj['num_polls'] - 1) + new_value) \
+                                 / rolling_obj['num_polls']
 
         if not isinstance(rolling_obj['accum'], str) and not isinstance(new_value, str):
             rolling_obj['accum'] = rolling_obj['accum'] + new_value
-            #print "Accumulated {0} + {1} = {2}".format(rolling_obj, new_value, result)
 
     else:
         # Initialize our rolling_obj object
-        rolling_obj = {'max': new_value, 'avg': new_value, 'min': new_value, 'accum': new_value, 'num_polls': 1}
+        rolling_obj = {'max': new_value,
+                       'avg': new_value,
+                       'min': new_value,
+                       'accum': new_value,
+                       'num_polls': 1}
 
-    #print "\n\nReturning result: {0}".format(rolling_obj)
     return rolling_obj
 
 
@@ -434,33 +410,49 @@ def backup_file(orig_file):
         os.rename(orig_file, orig_file + '.bak')
 
 
-def test_rollup():
-    rd = {}
-    obj1 = {'cpu': 2, 'mem': {'top': 3}}
-    rollup_dict(rd, obj1)
-    pp.pprint(rd)
-    print "\n"
+def main():
+    """Main"""
+    global ARGS
+    ARGS = parse_args()
 
-    obj2 = {'cpu': 3, 'mem': {'top': 2}}
-    rollup_dict(rd, obj2)
-    pp.pprint(rd)
-    print "\n"
+    if ARGS.version:
+        print "profiler {0}".format(VERSION)
+        sys.exit(0)
 
-    obj3 = {'cpu': 4, 'mem': {'top': 0}}
-    rollup_dict(rd, obj3)
-    pp.pprint(rd)
-    print "\n"
+    # Handle the different ways we can redirect stdin/stdout of this script and
+    #  the command we're watching
+    if ARGS.stdout is not None:
+        backup_file(ARGS.stdout)
+        cmd_stdout = open(ARGS.stdout, 'w')
+    else:
+        cmd_stdout = open('/dev/null', 'w')
+
+    if ARGS.stderr is not None:
+        backup_file(ARGS.stderr)
+        cmd_stderr = open(ARGS.stderr, 'w')
+    else:
+        cmd_stderr = open('/dev/null', 'w')
+
+    # Run the command, or grab an existing one
+    if ARGS.cmd:
+        profiler = Profiler(cmd=ARGS.cmd, stdout=cmd_stdout, stderr=cmd_stderr, outfile=ARGS.out)
+        profiler.run()
+
+    elif ARGS.pid:
+        profiler = Profiler(pid=ARGS.pid)
+
+    else:
+        print "You must specify --cmd or --pid"
+        sys.exit(1)
+
+    # Watch it til it dies
+    profiler.watch_process()
+
+    # Report results
+    profiler.report()
 
 
-    only_accum = filter_dict(rd, ['max', 'min', 'avg', 'num_polls'])
-    pp.pprint(only_accum)
+## Main Entry
 
-    only_accum = flatten_dict(rd, ['accum'])
-    pp.pprint(only_accum)
-
-
-## Main
-
-#test_rollup()
-
-main()
+if __name__ == "__main__":
+    main()
