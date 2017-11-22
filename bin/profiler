@@ -1,7 +1,14 @@
 #!/usr/bin/env python
-"""
+'''
 Profile a command, giving max/avg threads, mem, i/o, etc..
-"""
+
+Helpful BASH alias:
+    profile() {
+        profiler --cmd="$*" --out=/tmp/profiler.out --stdout=/tmp/profiler.stdout --stderr=/tmp/profiler.stderr
+    }
+    enables simple usage: profile "MY LONG BASH COMMAND | COMMAND 2 > STUFF_HERE"
+'''
+
 
 #import collections
 import subprocess
@@ -103,6 +110,8 @@ class Profiler(object):
         """Run our command"""
 
         self.status = "starting"
+        self.report()
+
         self.popen = subprocess.Popen(self.cmd,
                                       shell=True,
                                       stderr=self.stderr,
@@ -111,8 +120,6 @@ class Profiler(object):
         if self.popen.pid:
             self.pid = self.popen.pid
             self.process = psutil.Process(self.pid)
-
-        self.report()
 
         # Our shell process should have at least 1 child, the command
         if len(self.process.children()) > 0:
@@ -160,7 +167,10 @@ class Profiler(object):
                 except psutil.TimeoutExpired:
                     pass
 
-            sys.stdout.flush()
+            try:
+                sys.stdout.flush()
+            except:
+                pass
 
         #print "Process {0} has exited".format(self.pid)
         filter_dict(self.rollup, ['accum', 'num_polls'])
@@ -215,7 +225,8 @@ class Profiler(object):
     def add_virt_infos(self, proc):
         """Add derived data info to the process"""
         # Add v_threads_running flag
-        proc['v_threads_running'] = proc['num_threads']
+        #proc['v_threads_running'] = proc['num_threads']
+        pass
 
 
     def plainify(self, obj):
